@@ -6,7 +6,7 @@ import (
 	"github.com/antlr4-go/antlr/v4"
 	"github.com/stretchr/testify/require"
 
-	"github.com/valkdb/postgresparser/gen"
+	"github.com/earlye/postgresparser/gen"
 )
 
 func TestLexer_JSONBCompoundQuestionTokens(t *testing.T) {

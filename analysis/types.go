@@ -4,7 +4,7 @@
 // can be consumed as an independent library.
 package analysis
 
-import "github.com/valkdb/postgresparser"
+import "github.com/earlye/postgresparser"
 
 // SQLCommand identifies the high-level SQL statement type.
 type SQLCommand string
