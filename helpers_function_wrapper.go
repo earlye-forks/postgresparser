@@ -9,7 +9,7 @@ import (
 
 	"github.com/antlr4-go/antlr/v4"
 
-	"github.com/valkdb/postgresparser/gen"
+	"github.com/earlye/postgresparser/gen"
 )
 
 // allowedWrapperFunctions is the canonical lowercase set of function names that
