@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/valkdb/postgresparser"
-	"github.com/valkdb/postgresparser/internal/ident"
+	"github.com/earlye/postgresparser"
+	"github.com/earlye/postgresparser/internal/ident"
 )
 
 // QueryAnalysisResult holds the combined results of query analysis.
