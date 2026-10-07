@@ -131,8 +131,9 @@ func findAndRecordUsage(result *ParsedQuery, ctx antlr.RuleContext, role ColumnU
 
 // extractExpressionSubqueries captures direct scalar subqueries in an
 // expression and stores them under result.Subqueries without flattening their
-// nested ColumnUsage into the parent query.
-func extractExpressionSubqueries(result *ParsedQuery, ctx antlr.RuleContext, tokens antlr.TokenStream) {
+// nested ColumnUsage into the parent query. clause is the enclosing clause the
+// expression belongs to (see SubqueryRef.SourceClause).
+func extractExpressionSubqueries(result *ParsedQuery, ctx antlr.RuleContext, clause string, tokens antlr.TokenStream) {
 	if result == nil || ctx == nil {
 		return
 	}
@@ -145,7 +146,7 @@ func extractExpressionSubqueries(result *ParsedQuery, ctx antlr.RuleContext, tok
 	collector := &expressionSubqueryCollector{BasePostgreSQLParserListener: &gen.BasePostgreSQLParserListener{}}
 	antlr.ParseTreeWalkerDefault.Walk(collector, tree)
 	for _, selectWithParens := range collector.subqueries {
-		subRef, err := buildSubqueryRef("", selectWithParens, tokens)
+		subRef, err := buildSubqueryRef("", clause, selectWithParens, tokens)
 		if err != nil || subRef == nil {
 			continue
 		}
@@ -238,6 +239,35 @@ func tableRefAliasOrName(tr TableRef) string {
 	return strings.TrimSpace(tr.Raw)
 }
 
+// nameListStrings returns the trimmed identifiers of a name_list (e.g. the
+// column alias list in WITH t(a, b) or (SELECT ...) sub(a, b)).
+func nameListStrings(nl gen.IName_listContext, tokens antlr.TokenStream) []string {
+	if nl == nil {
+		return nil
+	}
+	names := nl.AllName()
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if name := strings.TrimSpace(text(tokens, n)); name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// markNested returns a copy of tables with Nested set to true.
+func markNested(tables []TableRef) []TableRef {
+	if len(tables) == 0 {
+		return tables
+	}
+	out := make([]TableRef, len(tables))
+	for i, t := range tables {
+		t.Nested = true
+		out[i] = t
+	}
+	return out
+}
+
 // recordUsingJoinFromString parses a textual USING clause and records join usages for the two most recent base tables.
 func recordUsingJoinFromString(result *ParsedQuery, clause string) {
 	if result == nil {
@@ -316,9 +346,7 @@ func aliasFromAliasClause(alias gen.IAlias_clauseContext, tokens antlr.TokenStre
 		return ""
 	}
 	if alias.Colid() != nil {
-		if prc, ok := alias.Colid().(antlr.ParserRuleContext); ok {
-			return strings.TrimSpace(ctxText(tokens, prc))
-		}
+		return text(tokens, alias.Colid())
 	}
 	return ""
 }
@@ -332,9 +360,16 @@ func aliasFromFuncAlias(alias gen.IFunc_alias_clauseContext, tokens antlr.TokenS
 		return aliasFromAliasClause(alias.Alias_clause(), tokens)
 	}
 	if alias.Colid() != nil {
-		if prc, ok := alias.Colid().(antlr.ParserRuleContext); ok {
-			return strings.TrimSpace(ctxText(tokens, prc))
-		}
+		return text(tokens, alias.Colid())
+	}
+	return ""
+}
+
+// text returns the trimmed source text covered by node, or "" when node is not
+// a parser rule context.
+func text(tokens antlr.TokenStream, node antlr.Tree) string {
+	if prc, ok := node.(antlr.ParserRuleContext); ok {
+		return strings.TrimSpace(ctxText(tokens, prc))
 	}
 	return ""
 }

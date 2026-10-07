@@ -11,6 +11,7 @@ import (
 )
 
 // extractSetOperationsWithResult traverses UNION/INTERSECT/EXCEPT chains with optional result for column usage recording.
+// A leading primary with its own FROM clause is skipped: the main SELECT flow already extracts it fully.
 func extractSetOperationsWithResult(selectNoParens gen.ISelect_no_parensContext, tokens antlr.TokenStream, cteNames map[string]struct{}, result *ParsedQuery) ([]SetOperation, []TableRef, []SubqueryRef) {
 	if selectNoParens == nil {
 		return nil, nil, nil
@@ -61,12 +62,9 @@ func extractSetOperationsWithResult(selectNoParens gen.ISelect_no_parensContext,
 	}
 
 	if first := clauseCtx.Simple_select_intersect(0); first != nil {
-		// Only process the first primary if there are actual set operations
-		// Otherwise it was already processed by extractWhereClause in the main SELECT
 		if hasSetOps {
-			if primary := first.Simple_select_pramary(0); primary != nil {
-				// Pass result through to capture column usage from first SELECT
-				firstTables, firstSubs := extractTablesAndUsageForPrimary(primary, tokens, cteNames, result)
+			if primary := first.Simple_select_pramary(0); primary != nil && primary.From_clause() == nil {
+				firstTables, firstSubs := extractTablesAndUsageForPrimary(primary, tokens, cteNames, nil)
 				leading = append(leading, firstTables...)
 				subqueries = append(subqueries, firstSubs...)
 			}
@@ -173,7 +171,7 @@ func collectIntersectOperationsWithResult(node gen.ISimple_select_intersectConte
 			continue
 		}
 
-		op, opSubs := buildSetOperationFromPrimary(opType, primary, tokens, cteNames)
+		op, opSubs := buildSetOperationFromPrimary(opType, primary, tokens, cteNames, result)
 		ops = append(ops, op)
 		subqueries = append(subqueries, opSubs...)
 		nestedOps, nestedLeading, nestedSubs := collectNestedSetOperationsFromPrimary(primary, tokens, cteNames)
@@ -189,9 +187,7 @@ func collectIntersectOperationsWithResult(node gen.ISimple_select_intersectConte
 // buildSetOperationFromIntersect materialises metadata for a UNION/EXCEPT right-hand SELECT.
 func buildSetOperationFromIntersect(opType string, rhs gen.ISimple_select_intersectContext, tokens antlr.TokenStream, cteNames map[string]struct{}, result *ParsedQuery) (SetOperation, []SubqueryRef) {
 	query := ""
-	if prc, ok := rhs.(antlr.ParserRuleContext); ok {
-		query = strings.TrimSpace(ctxText(tokens, prc))
-	}
+	query = text(tokens, rhs)
 	op := SetOperation{
 		Type:  strings.TrimSpace(opType),
 		Query: query,
@@ -208,12 +204,11 @@ func buildSetOperationFromIntersect(opType string, rhs gen.ISimple_select_inters
 }
 
 // buildSetOperationFromPrimary materialises metadata for an INTERSECT primary SELECT.
-func buildSetOperationFromPrimary(opType string, primary gen.ISimple_select_pramaryContext, tokens antlr.TokenStream, cteNames map[string]struct{}) (SetOperation, []SubqueryRef) {
-	tables, subqueries := extractTablesForPrimary(primary, tokens, cteNames)
+func buildSetOperationFromPrimary(opType string, primary gen.ISimple_select_pramaryContext, tokens antlr.TokenStream, cteNames map[string]struct{}, result *ParsedQuery) (SetOperation, []SubqueryRef) {
+	// Pass result through to capture column usage
+	tables, subqueries := extractTablesAndUsageForPrimary(primary, tokens, cteNames, result)
 	query := ""
-	if prc, ok := primary.(antlr.ParserRuleContext); ok {
-		query = strings.TrimSpace(ctxText(tokens, prc))
-	}
+	query = text(tokens, primary)
 	return SetOperation{
 		Type:    strings.TrimSpace(opType),
 		Query:   query,
@@ -255,11 +250,6 @@ func collectNestedSetOperationsFromPrimary(primary gen.ISimple_select_pramaryCon
 	return extractSetOperationsWithResult(inner, tokens, cteNames, nil)
 }
 
-// extractTablesForPrimary recovers table references and nested subqueries from a select primary.
-func extractTablesForPrimary(primary gen.ISimple_select_pramaryContext, tokens antlr.TokenStream, cteNames map[string]struct{}) ([]TableRef, []SubqueryRef) {
-	return extractTablesAndUsageForPrimary(primary, tokens, cteNames, nil)
-}
-
 // extractTablesAndUsageForPrimary recovers table references, subqueries, and column usage from a select primary.
 func extractTablesAndUsageForPrimary(primary gen.ISimple_select_pramaryContext, tokens antlr.TokenStream, cteNames map[string]struct{}, result *ParsedQuery) ([]TableRef, []SubqueryRef) {
 	if primary == nil {
@@ -276,16 +266,14 @@ func extractTablesAndUsageForPrimary(primary gen.ISimple_select_pramaryContext, 
 		targetResult = result
 	}
 	if where := primary.Where_clause(); where != nil {
-		// Use the new comparison-aware extraction for WHERE clauses
+		// Set-op branch WHERE: enable wrapper extraction.
 		if whereExpr := where.A_expr(); whereExpr != nil {
-			findAndRecordComparisons(targetResult, whereExpr, ColumnUsageTypeFilter, tokens)
+			findAndRecordComparisons(targetResult, whereExpr, ColumnUsageTypeFilter, tokens, true)
 		}
 	}
 	if primary.TABLE() != nil && primary.Relation_expr() != nil {
 		name := ""
-		if prc, ok := primary.Relation_expr().(antlr.ParserRuleContext); ok {
-			name = strings.TrimSpace(ctxText(tokens, prc))
-		}
+		name = text(tokens, primary.Relation_expr())
 		schema, relation := splitQualifiedName(name)
 		tableType := TableTypeBase
 		if _, ok := cteNames[strings.ToLower(relation)]; ok {
@@ -301,16 +289,17 @@ func extractTablesAndUsageForPrimary(primary gen.ISimple_select_pramaryContext, 
 	if primary.Select_with_parens() != nil {
 		// Build nested subquery analysis without flattening inner column usage
 		// into the parent query scope.
-		if subRef, err := buildSubqueryRef("", primary.Select_with_parens(), tokens); err == nil && subRef != nil {
+		if subRef, err := buildSubqueryRef("", "SETOP", primary.Select_with_parens(), tokens); err == nil && subRef != nil {
 			tmp.Subqueries = append(tmp.Subqueries, *subRef)
-			tmp.Tables = append(tmp.Tables, subRef.Query.Tables...)
+			tmp.Tables = append(tmp.Tables, markNested(subRef.Query.Tables)...)
 		}
 	}
 	return tmp.Tables, tmp.Subqueries
 }
 
 // buildSubqueryRef parses a parenthesised subquery into nested IR.
-func buildSubqueryRef(alias string, selectWithParens gen.ISelect_with_parensContext, tokens antlr.TokenStream) (*SubqueryRef, error) {
+// sourceClause records the clause the subquery was found in (see SubqueryRef.SourceClause).
+func buildSubqueryRef(alias, sourceClause string, selectWithParens gen.ISelect_with_parensContext, tokens antlr.TokenStream) (*SubqueryRef, error) {
 	if selectWithParens == nil {
 		return nil, nil
 	}
@@ -322,21 +311,20 @@ func buildSubqueryRef(alias string, selectWithParens gen.ISelect_with_parensCont
 		return nil, fmt.Errorf("unable to resolve subquery select")
 	}
 	rawSQL := ""
-	if prc, ok := selectWithParens.(antlr.ParserRuleContext); ok {
-		rawSQL = strings.TrimSpace(ctxText(tokens, prc))
-	}
+	rawSQL = text(tokens, selectWithParens)
 	parsed := &ParsedQuery{
 		Command:        QueryCommandSelect,
 		RawSQL:         rawSQL,
 		DerivedColumns: make(map[string]string),
 	}
-	if err := populateSelectFromResolvedNested(parsed, withClause, simple, selectNoParens, tokens, true); err != nil {
+	if err := populateSelectFromResolved(parsed, withClause, simple, selectNoParens, tokens, true); err != nil {
 		return nil, err
 	}
 
 	return &SubqueryRef{
-		Alias: alias,
-		Query: parsed,
+		Alias:        alias,
+		SourceClause: sourceClause,
+		Query:        parsed,
 	}, nil
 }
 

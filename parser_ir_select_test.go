@@ -234,6 +234,44 @@ func TestIR_LimitOffset(t *testing.T) {
 	assert.Contains(t, strings.ToUpper(ir.Limit.Offset), "OFFSET 5", "unexpected offset text")
 }
 
+// TestIR_TextExtractionAcrossSelectFields keeps the shared text helper covered
+// across the SELECT fields that rely on trimmed parser-source extraction.
+func TestIR_TextExtractionAcrossSelectFields(t *testing.T) {
+	sql := `
+WITH active_users AS MATERIALIZED (
+  SELECT id FROM users
+)
+SELECT active_users.id AS user_id
+FROM active_users
+ORDER BY active_users.id DESC NULLS LAST
+LIMIT 10 OFFSET 2`
+
+	ir := parseAssertNoError(t, sql)
+
+	require.Len(t, ir.CTEs, 1, "expected 1 CTE")
+	assert.Equal(t, "active_users", ir.CTEs[0].Name, "unexpected CTE name")
+	assert.Equal(t, "MATERIALIZED", ir.CTEs[0].Materialized, "unexpected CTE materialization")
+	assert.Contains(t, ir.CTEs[0].Query, "SELECT id FROM users", "unexpected CTE query")
+
+	require.Len(t, ir.Columns, 1, "expected 1 projected column")
+	assert.Equal(t, "active_users.id", ir.Columns[0].Expression, "unexpected projection expression")
+	assert.Equal(t, "user_id", ir.Columns[0].Alias, "unexpected projection alias")
+
+	require.Len(t, ir.Tables, 2, "expected base table plus CTE reference")
+	assert.Equal(t, "active_users", ir.Tables[1].Name, "unexpected CTE table reference")
+	assert.Equal(t, TableTypeCTE, ir.Tables[1].Type, "unexpected table type")
+	assert.Equal(t, "active_users", ir.Tables[1].Raw, "unexpected raw table text")
+
+	require.Len(t, ir.OrderBy, 1, "expected 1 ORDER BY")
+	assert.Equal(t, "active_users.id", ir.OrderBy[0].Expression, "unexpected ORDER BY expression")
+	assert.Equal(t, "DESC", ir.OrderBy[0].Direction, "unexpected ORDER BY direction")
+	assert.Equal(t, "NULLS LAST", ir.OrderBy[0].Nulls, "unexpected ORDER BY nulls")
+
+	require.NotNil(t, ir.Limit, "expected LIMIT metadata")
+	assert.Equal(t, "LIMIT 10", ir.Limit.Limit, "unexpected LIMIT text")
+	assert.Equal(t, "OFFSET 2", ir.Limit.Offset, "unexpected OFFSET text")
+}
+
 // TestIR_Parameters ensures positional and anonymous parameters are recorded.
 func TestIR_Parameters(t *testing.T) {
 	sql := `SELECT * FROM users WHERE age > ? AND id = $2`
@@ -493,4 +531,61 @@ func TestContainsWordDot(t *testing.T) {
 		got := containsWordDot(tt.text, tt.word)
 		assert.Equal(t, tt.want, got, "containsWordDot(%q, %q)", tt.text, tt.word)
 	}
+}
+
+func TestIR_LateralDetection_GrammarDriven(t *testing.T) {
+	t.Run("positive_cross_join_lateral_func_with_outer_correlation", func(t *testing.T) {
+		// CROSS JOIN LATERAL <func>(c.alias_ref) — outer alias `c` referenced.
+		sql := `SELECT * FROM customers c CROSS JOIN LATERAL generate_series(1, c.id) AS gs`
+		ir := parseAssertNoError(t, sql)
+
+		var found bool
+		for _, corr := range ir.Correlations {
+			if corr.Type == "LATERAL" && corr.OuterAlias == "c" {
+				found = true
+				break
+			}
+		}
+		assert.True(t, found, "expected LATERAL correlation for outer alias 'c', got %+v", ir.Correlations)
+	})
+
+	t.Run("negative_table_name_contains_lateral_substring", func(t *testing.T) {
+		// `bilateral_offsets` contains "lateral" as a substring but the query
+		// has no LATERAL keyword anywhere. detectLateralCorrelation must not run.
+		sql := `SELECT * FROM bilateral_offsets bo
+			CROSS JOIN generate_series(1, 10) AS gs`
+		ir := parseAssertNoError(t, sql)
+
+		assert.Empty(t, ir.Correlations,
+			"no LATERAL keyword present; substring 'lateral' in table name must not trigger detection: %+v", ir.Correlations)
+	})
+
+	t.Run("negative_column_name_contains_lateral_substring", func(t *testing.T) {
+		sql := `SELECT lateral_value FROM metrics
+			CROSS JOIN generate_series(1, 10) AS gs`
+		ir := parseAssertNoError(t, sql)
+
+		assert.Empty(t, ir.Correlations,
+			"no LATERAL keyword present; substring 'lateral' in column name must not trigger detection: %+v", ir.Correlations)
+	})
+
+	t.Run("negative_string_literal_contains_lateral", func(t *testing.T) {
+		sql := `SELECT * FROM t
+			CROSS JOIN generate_series(1, 10) AS gs
+			WHERE notes = 'lateral metric notes'`
+		ir := parseAssertNoError(t, sql)
+
+		assert.Empty(t, ir.Correlations,
+			"no LATERAL keyword present; substring 'lateral' inside string literal must not trigger detection: %+v", ir.Correlations)
+	})
+
+	t.Run("negative_alias_contains_lateral_substring", func(t *testing.T) {
+		// Alias `lateral_alias` contains "lateral" as a substring; no LATERAL keyword.
+		sql := `SELECT * FROM events lateral_alias
+			CROSS JOIN generate_series(1, 10) AS gs`
+		ir := parseAssertNoError(t, sql)
+
+		assert.Empty(t, ir.Correlations,
+			"no LATERAL keyword present; substring 'lateral' in alias must not trigger detection: %+v", ir.Correlations)
+	})
 }

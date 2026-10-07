@@ -1038,6 +1038,229 @@ func TestExtractWhereConditions_TableResolution(t *testing.T) {
 	}
 }
 
+// TestExtractWhereConditionsWithSchema verifies schema-based table resolution
+// for unqualified columns in multi-table queries.
+func TestExtractWhereConditionsWithSchema(t *testing.T) {
+	schemaMap := map[string][]ColumnSchema{
+		"orders": {
+			{Name: "id", PGType: "integer", IsPrimaryKey: true},
+			{Name: "customer_id", PGType: "integer"},
+			{Name: "total", PGType: "numeric"},
+			{Name: "created_at", PGType: "timestamptz"},
+		},
+		"customers": {
+			{Name: "id", PGType: "integer", IsPrimaryKey: true},
+			{Name: "country", PGType: "text"},
+			{Name: "created_at", PGType: "timestamptz"},
+		},
+	}
+
+	tests := []struct {
+		name           string
+		query          string
+		expectedTable  string
+		expectedColumn string
+	}{
+		{
+			// Exact case from issue #75.
+			name: "unqualified column resolved via schema",
+			query: `SELECT *
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+WHERE total > 100`,
+			expectedTable:  "orders",
+			expectedColumn: "total",
+		},
+		{
+			name:           "column in both tables stays unresolved",
+			query:          "SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id WHERE created_at > '2026-01-01'",
+			expectedTable:  "",
+			expectedColumn: "created_at",
+		},
+		{
+			name:           "column in neither table stays unresolved",
+			query:          "SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id WHERE missing_col = 1",
+			expectedTable:  "",
+			expectedColumn: "missing_col",
+		},
+		{
+			name:           "qualified column keeps alias resolution",
+			query:          "SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id WHERE c.country = 'US'",
+			expectedTable:  "customers",
+			expectedColumn: "country",
+		},
+		{
+			name:           "single-table fallback still applies without schema entry",
+			query:          "SELECT * FROM payments WHERE amount > 5",
+			expectedTable:  "payments",
+			expectedColumn: "amount",
+		},
+		{
+			name:           "self-join resolves to the shared table",
+			query:          "SELECT * FROM orders a JOIN orders b ON a.id = b.id WHERE total > 100",
+			expectedTable:  "orders",
+			expectedColumn: "total",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conditions, err := ExtractWhereConditionsWithSchema(tt.query, schemaMap)
+
+			require.NoError(t, err)
+			require.Len(t, conditions, 1)
+			assert.Equal(t, tt.expectedTable, conditions[0].Table)
+			assert.Equal(t, tt.expectedColumn, conditions[0].Column)
+		})
+	}
+}
+
+// TestExtractWhereConditionsWithSchema_CTEAndDerived verifies unqualified WHERE
+// columns resolve against CTE and derived-table projections, and are not
+// misattributed to base tables flattened in from inside those bodies (issue #77).
+func TestExtractWhereConditionsWithSchema_CTEAndDerived(t *testing.T) {
+	schemaMap := map[string][]ColumnSchema{
+		"orders": {
+			{Name: "id", IsPrimaryKey: true},
+			{Name: "customer_id"},
+			{Name: "total"},
+		},
+		"customers": {
+			{Name: "id", IsPrimaryKey: true},
+			{Name: "country"},
+		},
+	}
+
+	tests := []struct {
+		name          string
+		query         string
+		expectedTable string
+	}{
+		{
+			// total is projected by the CTE; the base "orders" inside the CTE body
+			// must not steal the attribution.
+			name: "column resolves to CTE, not nested base table",
+			query: `WITH recent_orders AS (SELECT id, customer_id, total FROM orders)
+SELECT * FROM recent_orders r JOIN customers c ON c.id = r.customer_id WHERE total > 100`,
+			expectedTable: "recent_orders",
+		},
+		{
+			name:          "column resolves to derived table projection",
+			query:         `SELECT * FROM (SELECT id, total FROM orders) sub JOIN customers c ON c.id = sub.id WHERE total > 100`,
+			expectedTable: "sub",
+		},
+		{
+			name:          "aliased projection column resolves to the CTE",
+			query:         `WITH t AS (SELECT o.amount AS total FROM orders o) SELECT * FROM t JOIN customers c ON c.id = 1 WHERE total > 1`,
+			expectedTable: "t",
+		},
+		{
+			// total exists in the CTE projection and a directly-joined base table.
+			name:          "collision between CTE and base table stays unresolved",
+			query:         `WITH t AS (SELECT total FROM orders) SELECT * FROM t JOIN orders o ON o.id = 1 WHERE total > 1`,
+			expectedTable: "",
+		},
+		{
+			name:          "SELECT star CTE alone resolves opaquely",
+			query:         `WITH t AS (SELECT * FROM orders) SELECT * FROM t WHERE total > 1`,
+			expectedTable: "t",
+		},
+		{
+			// SELECT * relation is opaque, so a column also present in a base table
+			// is ambiguous.
+			name:          "SELECT star CTE with base table is ambiguous",
+			query:         `WITH t AS (SELECT * FROM orders) SELECT * FROM t JOIN customers c ON c.id = 1 WHERE country = 'US'`,
+			expectedTable: "",
+		},
+		{
+			name:          "CTE column alias list exposes declared name",
+			query:         `WITH t(x) AS (SELECT total FROM orders) SELECT * FROM t JOIN customers c ON c.id = 1 WHERE x > 1`,
+			expectedTable: "t",
+		},
+		{
+			name:          "CTE column alias list hides inner column name",
+			query:         `WITH t(x) AS (SELECT total FROM orders) SELECT * FROM t JOIN customers c ON c.id = 1 WHERE total > 1`,
+			expectedTable: "",
+		},
+		{
+			name:          "derived table column alias list exposes declared name",
+			query:         `SELECT * FROM (SELECT total FROM orders) AS sub(x) JOIN customers c ON c.id = 1 WHERE x > 1`,
+			expectedTable: "sub",
+		},
+		{
+			name:          "derived table column alias list hides inner column name",
+			query:         `SELECT * FROM (SELECT total FROM orders) AS sub(x) JOIN customers c ON c.id = 1 WHERE total > 1`,
+			expectedTable: "",
+		},
+		{
+			// A short alias list renames only the leading column; the rest keep
+			// their projected names, so customer_id remains exposed by t.
+			name:          "short alias list keeps trailing projected columns",
+			query:         `WITH t(x) AS (SELECT total, customer_id FROM orders) SELECT * FROM t JOIN customers c ON c.id = 1 WHERE customer_id = 1`,
+			expectedTable: "t",
+		},
+		{
+			// total::numeric is still exposed as total.
+			name:          "casted projection column keeps its name",
+			query:         `WITH t AS (SELECT total::numeric, id FROM orders) SELECT * FROM t JOIN customers c ON c.id = 1 WHERE total > 1`,
+			expectedTable: "t",
+		},
+		{
+			name:          "data-modifying CTE exposes RETURNING columns",
+			query:         `WITH t AS (UPDATE orders SET total = total + 1 RETURNING id, total) SELECT * FROM t JOIN customers c ON c.id = 1 WHERE total > 1`,
+			expectedTable: "t",
+		},
+		{
+			name:          "RETURNING implicit alias is exposed",
+			query:         `WITH t AS (UPDATE orders SET total = total + 1 RETURNING total new_total) SELECT * FROM t JOIN customers c ON c.id = 1 WHERE new_total > 1`,
+			expectedTable: "t",
+		},
+		{
+			// A subquery body re-reading a directly-joined table must not disturb
+			// resolution: the direct base relation still owns the column.
+			name:          "direct table resolves despite same table inside a subquery",
+			query:         `SELECT * FROM orders, (SELECT id FROM orders) sub JOIN customers c ON c.id = 1 WHERE total > 1`,
+			expectedTable: "orders",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conditions, err := ExtractWhereConditionsWithSchema(tt.query, schemaMap)
+			require.NoError(t, err)
+			require.Len(t, conditions, 1)
+			assert.Equal(t, tt.expectedTable, conditions[0].Table)
+		})
+	}
+}
+
+// TestExtractWhereConditionsWithSchema_NilSchema verifies a nil schemaMap
+// behaves exactly like ExtractWhereConditions.
+func TestExtractWhereConditionsWithSchema_NilSchema(t *testing.T) {
+	query := "SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id WHERE total > 100"
+
+	withSchema, err := ExtractWhereConditionsWithSchema(query, nil)
+	require.NoError(t, err)
+	plain, err := ExtractWhereConditions(query)
+	require.NoError(t, err)
+
+	assert.Equal(t, plain, withSchema)
+	require.Len(t, withSchema, 1)
+	assert.Empty(t, withSchema[0].Table)
+}
+
+// TestExtractWhereConditionsWithSchema_EmptyMapResolvesProjections verifies an
+// empty (non-nil) schema map still resolves CTE/derived relations, which do not
+// need base-table schema metadata.
+func TestExtractWhereConditionsWithSchema_EmptyMapResolvesProjections(t *testing.T) {
+	query := `WITH t AS (SELECT x FROM src) SELECT * FROM t JOIN other o ON o.id = 1 WHERE x = 1`
+
+	conditions, err := ExtractWhereConditionsWithSchema(query, map[string][]ColumnSchema{})
+	require.NoError(t, err)
+	require.Len(t, conditions, 1)
+	assert.Equal(t, "t", conditions[0].Table)
+}
+
 // TestBuildWhereAliasMap verifies WHERE alias-map resolution behavior.
 func TestBuildWhereAliasMap(t *testing.T) {
 	tables := []postgresparser.TableRef{
@@ -1085,12 +1308,77 @@ func TestExtractInValues(t *testing.T) {
 			input:    "()",
 			expected: []string{},
 		},
+		{
+			name:     "quoted values containing commas",
+			input:    "('Doe, Jane', 'Smith, John')",
+			expected: []string{"Doe, Jane", "Smith, John"},
+		},
+		{
+			name:     "nested function calls",
+			input:    "(coalesce($1, 0), coalesce($2, 0))",
+			expected: []string{"coalesce($1, 0)", "coalesce($2, 0)"},
+		},
+		{
+			name:     "array values with internal commas",
+			input:    "(ARRAY['a,b', 'c'], ARRAY[1, 2])",
+			expected: []string{"ARRAY['a,b', 'c']", "ARRAY[1, 2]"},
+		},
+		{
+			name:     "double-quoted identifier containing comma",
+			input:    `("weird,col", 'x')`,
+			expected: []string{"weird,col", "x"},
+		},
+		{
+			name:     "escaped quote inside string",
+			input:    "('it''s, fine', 'b')",
+			expected: []string{"it''s, fine", "b"},
+		},
+		{
+			name:     "row constructor values",
+			input:    "((1, 2), (3, 4))",
+			expected: []string{"(1, 2)", "(3, 4)"},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := extractInValues(tt.input)
 			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+// TestExtractWhereConditions_InValuesWithCommas verifies IN lists whose values
+// contain commas are not split at nested commas (issue #69 acceptance cases).
+func TestExtractWhereConditions_InValuesWithCommas(t *testing.T) {
+	tests := []struct {
+		name           string
+		query          string
+		expectedValues []string
+	}{
+		{
+			name:           "quoted strings with commas",
+			query:          "SELECT * FROM users WHERE name IN ('Doe, Jane', 'Smith, John')",
+			expectedValues: []string{"Doe, Jane", "Smith, John"},
+		},
+		{
+			name:           "nested function calls",
+			query:          "SELECT * FROM users WHERE id IN (coalesce($1, 0), coalesce($2, 0))",
+			expectedValues: []string{"coalesce($1, 0)", "coalesce($2, 0)"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conditions, err := ExtractWhereConditions(tt.query)
+
+			require.NoError(t, err)
+			require.Len(t, conditions, 1)
+			assert.Equal(t, "IN", conditions[0].Operator)
+
+			values, ok := conditions[0].Value.([]string)
+			require.True(t, ok, "IN value should be []string, got %T", conditions[0].Value)
+			assert.Equal(t, tt.expectedValues, values)
 		})
 	}
 }
@@ -1404,6 +1692,119 @@ func TestExtractWhereConditions_Functions(t *testing.T) {
 			// Function calls in WHERE may not extract as traditional column conditions
 			// This test validates the parser doesn't fail on such queries
 			_ = conditions // Implementation may vary
+		})
+	}
+}
+
+// TestExtractWhereConditions_JSONBExtractionForms exercises JSONB extraction
+// across simple identifiers, quoted identifiers, path operators with
+// brace-style paths, and casted extraction (including schema-qualified casts).
+func TestExtractWhereConditions_JSONBExtractionForms(t *testing.T) {
+	tests := []struct {
+		name       string
+		query      string
+		wantTable  string
+		wantColumn string
+		wantKey    string
+		wantCast   string
+		wantValue  string
+	}{
+		{
+			name:       "simple unquoted identifier",
+			query:      `SELECT * FROM orders WHERE order_details->>'shipping_method' = 'express'`,
+			wantTable:  "orders",
+			wantColumn: "order_details",
+			wantKey:    "shipping_method",
+			wantValue:  "express",
+		},
+		{
+			name:       "alias-qualified unquoted identifier",
+			query:      `SELECT * FROM orders o WHERE o.order_details->>'shipping_method' = 'express'`,
+			wantTable:  "orders",
+			wantColumn: "order_details",
+			wantKey:    "shipping_method",
+			wantValue:  "express",
+		},
+		{
+			name:       "quoted column without alias",
+			query:      `SELECT * FROM users WHERE "metadata"->>'plan' = 'pro'`,
+			wantTable:  "users",
+			wantColumn: "metadata",
+			wantKey:    "plan",
+			wantValue:  "pro",
+		},
+		{
+			name:       "alias plus quoted column",
+			query:      `SELECT * FROM "users" u WHERE u."metadata"->>'plan' = 'pro'`,
+			wantTable:  "users",
+			wantColumn: "metadata",
+			wantKey:    "plan",
+			wantValue:  "pro",
+		},
+		{
+			name:       "fully quoted alias and column",
+			query:      `SELECT * FROM "users" "u" WHERE "u"."metadata"->>'plan' = 'pro'`,
+			wantTable:  "users",
+			wantColumn: "metadata",
+			wantKey:    "plan",
+			wantValue:  "pro",
+		},
+		{
+			name:       "path operator with brace-style path",
+			query:      `SELECT * FROM events WHERE payload #>> '{user,email}' = 'a@example.com'`,
+			wantTable:  "events",
+			wantColumn: "payload",
+			wantKey:    "{user,email}",
+			wantValue:  "a@example.com",
+		},
+		{
+			name:       "casted extraction with simple type",
+			query:      `SELECT * FROM events WHERE (payload->>'score')::numeric >= 90`,
+			wantTable:  "events",
+			wantColumn: "payload",
+			wantKey:    "score",
+			wantCast:   "numeric",
+			wantValue:  "90",
+		},
+		{
+			name:       "casted extraction with schema-qualified type",
+			query:      `SELECT * FROM events WHERE (payload->>'v')::pg_catalog.text = 'x'`,
+			wantTable:  "events",
+			wantColumn: "payload",
+			wantKey:    "v",
+			wantCast:   "pg_catalog.text",
+			wantValue:  "x",
+		},
+		{
+			name:       "casted extraction with quoted column",
+			query:      `SELECT * FROM events e WHERE (e."payload"->>'score')::numeric >= 90`,
+			wantTable:  "events",
+			wantColumn: "payload",
+			wantKey:    "score",
+			wantCast:   "numeric",
+			wantValue:  "90",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conditions, err := ExtractWhereConditions(tt.query)
+			require.NoError(t, err)
+
+			var jsonbCond *WhereCondition
+			for i := range conditions {
+				if conditions[i].IsJSONB {
+					jsonbCond = &conditions[i]
+					break
+				}
+			}
+			require.NotNil(t, jsonbCond, "expected a JSONB condition")
+
+			assert.Equal(t, tt.wantTable, jsonbCond.Table, "table")
+			assert.Equal(t, tt.wantColumn, jsonbCond.Column, "column")
+			assert.Equal(t, tt.wantKey, jsonbCond.JSONBKey, "JSONBKey")
+			assert.Equal(t, tt.wantCast, jsonbCond.JSONBCast, "JSONBCast")
+			assert.Equal(t, tt.wantValue, jsonbCond.Value, "value")
 		})
 	}
 }

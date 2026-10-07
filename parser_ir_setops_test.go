@@ -108,3 +108,72 @@ SELECT user_id FROM revoked_permissions`,
 		})
 	}
 }
+
+// TestIR_SetOpWhereColumnUsage checks each set-operation branch records its
+// WHERE filter exactly once; the leading branch used to be recorded twice and
+// INTERSECT right-hand branches not at all.
+func TestIR_SetOpWhereColumnUsage(t *testing.T) {
+	for _, op := range []string{"UNION", "INTERSECT", "EXCEPT"} {
+		t.Run(op, func(t *testing.T) {
+			ir := parseAssertNoError(t, "SELECT a FROM t1 WHERE x = 1 "+op+" SELECT a FROM t2 WHERE y = 2")
+
+			for _, col := range []string{"x", "y"} {
+				count := 0
+				for _, usage := range ir.ColumnUsage {
+					if usage.UsageType == ColumnUsageTypeFilter && strings.EqualFold(usage.Column, col) {
+						count++
+					}
+				}
+				assert.Equal(t, 1, count, "expected filter column %s recorded exactly once", col)
+			}
+		})
+	}
+}
+
+// TestIR_SetOpLeadingFromSubqueryOnce checks a FROM subquery in the leading
+// set-op branch appears once in Subqueries; it used to be recorded twice.
+func TestIR_SetOpLeadingFromSubqueryOnce(t *testing.T) {
+	ir := parseAssertNoError(t, "SELECT a FROM (SELECT a FROM inner_t) s WHERE x = 1 UNION SELECT a FROM t2 WHERE y = 2")
+
+	count := 0
+	for _, sq := range ir.Subqueries {
+		if sq.SourceClause == "FROM" && sq.Alias == "s" {
+			count++
+		}
+	}
+	assert.Equal(t, 1, count, "expected leading FROM subquery recorded exactly once")
+	assert.True(t, containsTable(ir.Tables, "inner_t"), "expected inner_t surfaced in top-level tables")
+	assert.True(t, containsTable(ir.Tables, "t2"), "expected t2 surfaced in top-level tables")
+}
+
+// TestIR_SetOpBranchLimitIsNested guards the isNested flag propagation through
+// the consolidated populateSelectFromResolved entry-point: a LIMIT on the
+// top-level select must report IsNested=false, while a LIMIT inside a
+// set-operation branch must report IsNested=true.
+func TestIR_SetOpBranchLimitIsNested(t *testing.T) {
+	sql := `
+(SELECT id FROM a)
+UNION ALL
+(SELECT id FROM b LIMIT 5)
+LIMIT 10`
+
+	ir := parseAssertNoError(t, sql)
+
+	require.NotNil(t, ir.Limit, "expected top-level LIMIT")
+	assert.Contains(t, ir.Limit.Limit, "10", "unexpected top-level LIMIT value")
+	assert.False(t, ir.Limit.IsNested, "expected IsNested=false on top-level LIMIT")
+
+	require.Len(t, ir.SetOperations, 1, "expected one set operation")
+	require.NotEmpty(t, ir.Subqueries, "expected set-op branch captured as subquery")
+
+	var branch *ParsedQuery
+	for _, sq := range ir.Subqueries {
+		if sq.Query != nil && sq.Query.Limit != nil {
+			branch = sq.Query
+			break
+		}
+	}
+	require.NotNil(t, branch, "expected a set-op branch ParsedQuery with a LIMIT")
+	assert.Contains(t, branch.Limit.Limit, "5", "unexpected branch LIMIT value")
+	assert.True(t, branch.Limit.IsNested, "expected IsNested=true on set-op branch LIMIT")
+}

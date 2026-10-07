@@ -118,6 +118,7 @@ func convertParsedQuery(pq *postgresparser.ParsedQuery) *SQLAnalysis {
 		GroupBy:       append([]string(nil), pq.GroupBy...),
 		JoinClauses:   append([]string(nil), pq.JoinConditions...),
 		Parameters:    convertParameters(pq.Parameters),
+		Placeholders:  convertPlaceholders(pq.Placeholders),
 		InsertColumns: append([]string(nil), pq.InsertColumns...),
 		SetClauses:    append([]string(nil), pq.SetClauses...),
 	}
@@ -145,6 +146,26 @@ func convertParsedQuery(pq *postgresparser.ParsedQuery) *SQLAnalysis {
 	return res
 }
 
+// cloneFunctionWrapper deep-copies a parser FunctionWrapper into an analysis-layer
+// pointer so analysis-side mutation cannot affect the parser IR. Returns nil for nil.
+func cloneFunctionWrapper(w *postgresparser.FunctionWrapper) *SQLFunctionWrapper {
+	if w == nil {
+		return nil
+	}
+	cp := *w
+	if len(w.Args) > 0 {
+		cp.Args = make([]postgresparser.FunctionArg, len(w.Args))
+		for i, a := range w.Args {
+			cp.Args[i] = postgresparser.FunctionArg{IsNull: a.IsNull}
+			if a.Literal != nil {
+				lit := *a.Literal
+				cp.Args[i].Literal = &lit
+			}
+		}
+	}
+	return &cp
+}
+
 // convertColumnUsage maps parser column-usage entries into analysis column usage entries.
 func convertColumnUsage(usage []postgresparser.ColumnUsage) []SQLColumnUsage {
 	if len(usage) == 0 {
@@ -161,6 +182,7 @@ func convertColumnUsage(usage []postgresparser.ColumnUsage) []SQLColumnUsage {
 			Operator:   u.Operator,
 			Side:       u.Side,
 			Functions:  append([]string(nil), u.Functions...),
+			Function:   cloneFunctionWrapper(u.Function),
 		})
 	}
 	return out
@@ -226,8 +248,9 @@ func convertSubqueries(subs []postgresparser.SubqueryRef) []SQLSubquery {
 	out := make([]SQLSubquery, 0, len(subs))
 	for _, s := range subs {
 		out = append(out, SQLSubquery{
-			Alias:    s.Alias,
-			Analysis: convertParsedQuery(s.Query),
+			Alias:        s.Alias,
+			SourceClause: s.SourceClause,
+			Analysis:     convertParsedQuery(s.Query),
 		})
 	}
 	return out
@@ -294,6 +317,23 @@ func convertParameters(params []postgresparser.Parameter) []SQLParameter {
 	return out
 }
 
+// convertPlaceholders maps parser placeholder metadata into analysis placeholders.
+func convertPlaceholders(placeholders []postgresparser.Placeholder) []Placeholder {
+	if len(placeholders) == 0 {
+		return nil
+	}
+	out := make([]Placeholder, 0, len(placeholders))
+	for _, p := range placeholders {
+		cp := p
+		if p.ParentFn != nil {
+			fn := *p.ParentFn
+			cp.ParentFn = &fn
+		}
+		out = append(out, cp)
+	}
+	return out
+}
+
 // convertCorrelations maps parser join-correlation metadata into analysis correlations.
 func convertCorrelations(corrs []postgresparser.JoinCorrelation) []SQLJoinCorrelation {
 	if len(corrs) == 0 {
@@ -343,8 +383,9 @@ func convertMerge(merge *postgresparser.MergeClause) *SQLMerge {
 	}
 	if merge.Source.Subquery != nil {
 		out.Source.Subquery = &SQLSubquery{
-			Alias:    merge.Source.Subquery.Alias,
-			Analysis: convertParsedQuery(merge.Source.Subquery.Query),
+			Alias:        merge.Source.Subquery.Alias,
+			SourceClause: merge.Source.Subquery.SourceClause,
+			Analysis:     convertParsedQuery(merge.Source.Subquery.Query),
 		}
 	}
 	return out
@@ -373,29 +414,46 @@ func normalizeReturning(items []string) []string {
 	return out
 }
 
-// splitCommasRespectingParens splits a string on commas that are not inside
-// parentheses or single-quoted string literals. This prevents incorrect splitting
-// of function arguments like "func(a, b)" into ["func(a", "b)"] and also handles
-// string literals like "concat('a,b', name)" correctly.
+// splitCommasRespectingParens splits a string on top-level commas only,
+// skipping commas inside parentheses, square brackets, single-quoted string
+// literals, and double-quoted identifiers. This prevents incorrect splitting
+// of values like "func(a, b)", "ARRAY['a,b', 'c']", or "'Doe, Jane'".
+// A SQL-escaped quote (two adjacent single-quote characters) toggles the
+// in-string state twice, so it cannot enclose a comma and needs no special
+// handling.
 func splitCommasRespectingParens(s string) []string {
 	var parts []string
-	depth := 0
-	inQuote := false
+	parenDepth, bracketDepth := 0, 0
+	inSingle, inDouble := false, false
 	start := 0
 	for i, ch := range s {
 		switch ch {
 		case '\'':
-			inQuote = !inQuote
+			if !inDouble {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
 		case '(':
-			if !inQuote {
-				depth++
+			if !inSingle && !inDouble {
+				parenDepth++
 			}
 		case ')':
-			if !inQuote && depth > 0 {
-				depth--
+			if !inSingle && !inDouble && parenDepth > 0 {
+				parenDepth--
+			}
+		case '[':
+			if !inSingle && !inDouble {
+				bracketDepth++
+			}
+		case ']':
+			if !inSingle && !inDouble && bracketDepth > 0 {
+				bracketDepth--
 			}
 		case ',':
-			if !inQuote && depth == 0 {
+			if !inSingle && !inDouble && parenDepth == 0 && bracketDepth == 0 {
 				parts = append(parts, s[start:i])
 				start = i + 1
 			}
@@ -424,17 +482,19 @@ func convertDDLActions(actions []postgresparser.DDLAction) []SQLDDLAction {
 	out := make([]SQLDDLAction, 0, len(actions))
 	for _, a := range actions {
 		out = append(out, SQLDDLAction{
-			Type:          string(a.Type),
-			ObjectName:    a.ObjectName,
-			ObjectType:    a.ObjectType,
-			Schema:        a.Schema,
-			Columns:       append([]string(nil), a.Columns...),
-			ColumnDetails: convertDDLColumns(a.ColumnDetails),
-			Constraints:   convertDDLConstraints(a.Constraints),
-			Flags:         append([]string(nil), a.Flags...),
-			IndexType:     a.IndexType,
-			Target:        a.Target,
-			Comment:       a.Comment,
+			Type:           string(a.Type),
+			ObjectName:     a.ObjectName,
+			ObjectType:     a.ObjectType,
+			Schema:         a.Schema,
+			Columns:        append([]string(nil), a.Columns...),
+			ColumnDetails:  convertDDLColumns(a.ColumnDetails),
+			Constraints:    convertDDLConstraints(a.Constraints),
+			Flags:          append([]string(nil), a.Flags...),
+			IndexType:      a.IndexType,
+			IncludeColumns: append([]string(nil), a.IncludeColumns...),
+			Predicate:      a.Predicate,
+			Target:         a.Target,
+			Comment:        a.Comment,
 		})
 	}
 	return out

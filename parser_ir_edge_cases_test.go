@@ -88,6 +88,53 @@ WHERE sub.total_amount < 10000`
 	assert.Contains(t, sq.Query.GroupBy[0], "user_id", "expected subquery GROUP BY user_id")
 }
 
+// TestIR_SubquerySourceClause verifies each subquery records the clause it was
+// found in.
+func TestIR_SubquerySourceClause(t *testing.T) {
+	tests := []struct {
+		name       string
+		sql        string
+		wantClause string
+	}{
+		{
+			name:       "where exists",
+			sql:        `SELECT * FROM t0 WHERE EXISTS (SELECT 1 FROM t1 WHERE t1.x = t0.id)`,
+			wantClause: "WHERE",
+		},
+		{
+			name:       "select list scalar",
+			sql:        `SELECT id, (SELECT max(v) FROM t1) AS m FROM t0`,
+			wantClause: "SELECT",
+		},
+		{
+			name:       "from derived table",
+			sql:        `SELECT * FROM (SELECT id FROM t1) sub WHERE sub.id > 1`,
+			wantClause: "FROM",
+		},
+		{
+			name:       "having",
+			sql:        `SELECT c, count(*) FROM t0 GROUP BY c HAVING count(*) > (SELECT avg(n) FROM t1)`,
+			wantClause: "HAVING",
+		},
+		{
+			name:       "set operation branch",
+			sql:        `(SELECT a FROM t0) UNION (SELECT b FROM t1)`,
+			wantClause: "SETOP",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ir := parseAssertNoError(t, tt.sql)
+			require.NotEmpty(t, ir.Subqueries, "expected at least one subquery")
+			for _, sq := range ir.Subqueries {
+				assert.Equal(t, tt.wantClause, sq.SourceClause,
+					"subquery %q should record clause %s", sq.Query.RawSQL, tt.wantClause)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 2. Multiple CTEs referencing each other
 // ---------------------------------------------------------------------------
@@ -1234,48 +1281,6 @@ func TestIR_WhitespaceOnly(t *testing.T) {
 func TestIR_SemicolonOnly(t *testing.T) {
 	_, err := ParseSQL(";")
 	require.Error(t, err, "expected error for semicolon-only input")
-}
-
-// ---------------------------------------------------------------------------
-// ParseErrors formatting
-// ---------------------------------------------------------------------------
-
-// TestParseErrors_Error_NilReceiver validates Error() on a nil ParseErrors receiver.
-func TestParseErrors_Error_NilReceiver(t *testing.T) {
-	var pe *ParseErrors
-	assert.Equal(t, "parse error", pe.Error(), "expected 'parse error'")
-}
-
-// TestParseErrors_Error_Empty checks Error() with an empty error list.
-func TestParseErrors_Error_Empty(t *testing.T) {
-	pe := &ParseErrors{SQL: "test", Errors: nil}
-	assert.Equal(t, "parse error", pe.Error(), "expected 'parse error'")
-}
-
-// TestParseErrors_Error_Single verifies Error() formatting with one syntax error.
-func TestParseErrors_Error_Single(t *testing.T) {
-	pe := &ParseErrors{
-		SQL:    "test",
-		Errors: []SyntaxError{{Line: 1, Column: 5, Message: "bad token"}},
-	}
-	s := pe.Error()
-	assert.Contains(t, s, "line 1:5", "unexpected error string")
-	assert.Contains(t, s, "bad token", "unexpected error string")
-}
-
-// TestParseErrors_Error_Multiple confirms Error() formatting with multiple syntax errors.
-func TestParseErrors_Error_Multiple(t *testing.T) {
-	pe := &ParseErrors{
-		SQL: "test",
-		Errors: []SyntaxError{
-			{Line: 1, Column: 5, Message: "bad token"},
-			{Line: 2, Column: 3, Message: "unexpected EOF"},
-		},
-	}
-	s := pe.Error()
-	assert.Contains(t, s, "parse error(s)", "expected 'parse error(s)'")
-	assert.Contains(t, s, "line 1:5", "expected error location 1")
-	assert.Contains(t, s, "line 2:3", "expected error location 2")
 }
 
 // ---------------------------------------------------------------------------

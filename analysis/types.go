@@ -4,6 +4,8 @@
 // can be consumed as an independent library.
 package analysis
 
+import "github.com/earlye/postgresparser"
+
 // SQLCommand identifies the high-level SQL statement type.
 type SQLCommand string
 
@@ -66,6 +68,53 @@ type SQLParameter struct {
 	Position int
 }
 
+// PlaceholderRole describes the syntactic position of a SQL placeholder.
+type PlaceholderRole = postgresparser.PlaceholderRole
+
+const (
+	PlaceholderRoleUnknown         = postgresparser.PlaceholderRoleUnknown
+	PlaceholderRoleWhereValue      = postgresparser.PlaceholderRoleWhereValue
+	PlaceholderRoleHavingValue     = postgresparser.PlaceholderRoleHavingValue
+	PlaceholderRoleSelectExpr      = postgresparser.PlaceholderRoleSelectExpr
+	PlaceholderRoleFunctionArg     = postgresparser.PlaceholderRoleFunctionArg
+	PlaceholderRoleLimit           = postgresparser.PlaceholderRoleLimit
+	PlaceholderRoleOffset          = postgresparser.PlaceholderRoleOffset
+	PlaceholderRoleGroupByOrdinal  = postgresparser.PlaceholderRoleGroupByOrdinal
+	PlaceholderRoleOrderByOrdinal  = postgresparser.PlaceholderRoleOrderByOrdinal
+	PlaceholderRoleIntervalOperand = postgresparser.PlaceholderRoleIntervalOperand
+	PlaceholderRoleArrayMember     = postgresparser.PlaceholderRoleArrayMember
+	PlaceholderRoleInsertValue     = postgresparser.PlaceholderRoleInsertValue
+	PlaceholderRoleUpdateSetValue  = postgresparser.PlaceholderRoleUpdateSetValue
+	PlaceholderRoleCaseExpr        = postgresparser.PlaceholderRoleCaseExpr
+	PlaceholderRoleInListMember    = postgresparser.PlaceholderRoleInListMember
+	PlaceholderRoleBetweenLow      = postgresparser.PlaceholderRoleBetweenLow
+	PlaceholderRoleBetweenHigh     = postgresparser.PlaceholderRoleBetweenHigh
+)
+
+// FunctionRef identifies a function call site in the parsed statement.
+type FunctionRef = postgresparser.FunctionRef
+
+// SQLFunctionWrapper is the analysis-layer alias for postgresparser.FunctionWrapper.
+// Surfaced on SQLColumnUsage entries originating from WHERE-clause predicates
+// where the subject column is wrapped by an allowlisted function.
+type SQLFunctionWrapper = postgresparser.FunctionWrapper
+
+// SQLFunctionArg is the analysis-layer alias for postgresparser.FunctionArg.
+type SQLFunctionArg = postgresparser.FunctionArg
+
+// CaseClause distinguishes positions inside a CASE expression.
+type CaseClause = postgresparser.CaseClause
+
+const (
+	CaseClauseUnknown   = postgresparser.CaseClauseUnknown
+	CaseClausePredicate = postgresparser.CaseClausePredicate
+	CaseClauseResult    = postgresparser.CaseClauseResult
+	CaseClauseDefault   = postgresparser.CaseClauseDefault
+)
+
+// Placeholder is one occurrence of `?` or `$N` in a parsed SQL statement.
+type Placeholder = postgresparser.Placeholder
+
 // SQLSetOperationType enumerates supported set-operation modifiers.
 type SQLSetOperationType string
 
@@ -88,8 +137,11 @@ type SQLSetOperation struct {
 
 // SQLSubquery references a derived table; Analysis may be nil if omitted.
 type SQLSubquery struct {
-	Alias    string
-	Analysis *SQLAnalysis
+	Alias string
+	// SourceClause is the clause the subquery was found in: "WHERE", "HAVING",
+	// "SELECT", "FROM", or "SETOP". Empty when the origin was not recorded.
+	SourceClause string
+	Analysis     *SQLAnalysis
 }
 
 // SQLCTE describes a common table expression.
@@ -173,6 +225,10 @@ type SQLColumnUsage struct {
 	Functions  []string
 	Operator   string
 	Side       string
+	// Function carries WHERE-clause wrapper metadata when the column is wrapped
+	// by an allowlisted function in a predicate position. Nil for non-WHERE
+	// usages and for non-allowlisted wrappers. See SQLFunctionWrapper.
+	Function *SQLFunctionWrapper
 }
 
 // SQLDDLColumn describes column-level metadata extracted from CREATE TABLE statements.
@@ -232,8 +288,14 @@ type SQLDDLAction struct {
 	Constraints   *SQLDDLConstraints
 	Flags         []string
 	IndexType     string
-	Target        string
-	Comment       string
+	// IncludeColumns lists non-key columns from CREATE INDEX ... INCLUDE (...).
+	IncludeColumns []string
+	// Predicate is the partial-index expression from CREATE INDEX ... WHERE ...
+	// (the bare expression, without the leading WHERE keyword). Empty when the
+	// index is not partial.
+	Predicate string
+	Target    string
+	Comment   string
 }
 
 // SQLParseWarningCode identifies non-fatal parser notices in analysis batch results.
@@ -267,6 +329,7 @@ type SQLAnalysis struct {
 	Limit          *SQLLimit
 	JoinClauses    []string
 	Parameters     []SQLParameter
+	Placeholders   []Placeholder
 	InsertColumns  []string
 	SetClauses     []string
 	Returning      []string

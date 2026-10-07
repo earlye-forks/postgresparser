@@ -61,6 +61,9 @@ type TableRef struct {
 	Raw           string
 	JoinType      string // "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", or "" for base FROM tables.
 	JoinCondition string // Raw ON/USING clause text, or "" for base/CROSS tables.
+	// Nested is true for relations surfaced from inside a CTE or subquery body,
+	// rather than this query's own FROM clause.
+	Nested bool
 }
 
 // SelectColumn captures the projection list of a SELECT query.
@@ -198,14 +201,26 @@ type DDLAction struct {
 	Constraints   *DDLConstraints // PK/FK/UNIQUE constraint metadata (CREATE TABLE, ALTER TABLE ADD CONSTRAINT)
 	Flags         []string        // IF_EXISTS, CONCURRENTLY, CASCADE, etc.
 	IndexType     string          // btree, gin, gist, hash (CREATE INDEX only)
-	Target        string          // Generic fully-qualified target path for comment-like actions.
-	Comment       string          // Comment text for COMMENT ON statements.
+	// IncludeColumns lists non-key columns from CREATE INDEX ... INCLUDE (...).
+	IncludeColumns []string
+	// Predicate is the partial-index expression from CREATE INDEX ... WHERE ...
+	// (the bare expression, without the leading WHERE keyword). Empty when the
+	// index is not partial.
+	Predicate string
+	Target    string // Generic fully-qualified target path for comment-like actions.
+	Comment   string // Comment text for COMMENT ON statements.
 }
 
 // SubqueryRef records metadata for subqueries discovered in FROM or set operations.
 type SubqueryRef struct {
 	Alias string
-	Query *ParsedQuery
+	// SourceClause is the clause the subquery was found in: "WHERE", "HAVING",
+	// "SELECT", "FROM", or "SETOP". Empty when the origin was not recorded.
+	SourceClause string
+	// ColumnAliases holds the explicit output column names from a derived table
+	// alias list (SELECT ...) sub(a, b); empty when not declared.
+	ColumnAliases []string
+	Query         *ParsedQuery
 }
 
 // OrderExpression describes ORDER BY items.
@@ -229,12 +244,126 @@ type Parameter struct {
 	Position int    // Parsed index for $n, or sequential order for '?'
 }
 
+// PlaceholderRole describes the syntactic position of a `?` or `$N`
+// placeholder in a parsed SQL statement.
+type PlaceholderRole int
+
+const (
+	PlaceholderRoleUnknown PlaceholderRole = iota
+	PlaceholderRoleWhereValue
+	PlaceholderRoleHavingValue
+	PlaceholderRoleSelectExpr
+	PlaceholderRoleFunctionArg
+	PlaceholderRoleLimit
+	PlaceholderRoleOffset
+	PlaceholderRoleGroupByOrdinal
+	PlaceholderRoleOrderByOrdinal
+	PlaceholderRoleIntervalOperand
+	PlaceholderRoleArrayMember
+	PlaceholderRoleInsertValue
+	PlaceholderRoleUpdateSetValue
+	PlaceholderRoleCaseExpr
+	PlaceholderRoleInListMember
+	PlaceholderRoleBetweenLow
+	PlaceholderRoleBetweenHigh
+)
+
+// String returns a stable lowercase identifier for serialization.
+func (r PlaceholderRole) String() string {
+	switch r {
+	case PlaceholderRoleWhereValue:
+		return "where_value"
+	case PlaceholderRoleHavingValue:
+		return "having_value"
+	case PlaceholderRoleSelectExpr:
+		return "select_expr"
+	case PlaceholderRoleFunctionArg:
+		return "function_arg"
+	case PlaceholderRoleLimit:
+		return "limit"
+	case PlaceholderRoleOffset:
+		return "offset"
+	case PlaceholderRoleGroupByOrdinal:
+		return "group_by_ordinal"
+	case PlaceholderRoleOrderByOrdinal:
+		return "order_by_ordinal"
+	case PlaceholderRoleIntervalOperand:
+		return "interval_operand"
+	case PlaceholderRoleArrayMember:
+		return "array_member"
+	case PlaceholderRoleInsertValue:
+		return "insert_value"
+	case PlaceholderRoleUpdateSetValue:
+		return "update_set_value"
+	case PlaceholderRoleCaseExpr:
+		return "case_expr"
+	case PlaceholderRoleInListMember:
+		return "in_list_member"
+	case PlaceholderRoleBetweenLow:
+		return "between_low"
+	case PlaceholderRoleBetweenHigh:
+		return "between_high"
+	default:
+		return "unknown"
+	}
+}
+
+// FunctionRef identifies a function call site in the parsed statement.
+type FunctionRef struct {
+	Name     string // Canonical lowercase function name.
+	ArgIndex int    // Zero-based index of this placeholder among function arguments.
+	ArgCount int    // Total number of arguments at the function call site.
+}
+
+// CaseClause distinguishes positions inside a CASE expression.
+type CaseClause int
+
+const (
+	CaseClauseUnknown CaseClause = iota
+	CaseClausePredicate
+	CaseClauseResult
+	CaseClauseDefault
+)
+
+// String returns a stable lowercase identifier for serialization.
+func (c CaseClause) String() string {
+	switch c {
+	case CaseClausePredicate:
+		return "predicate"
+	case CaseClauseResult:
+		return "result"
+	case CaseClauseDefault:
+		return "default"
+	default:
+		return "unknown"
+	}
+}
+
+// Placeholder is one occurrence of `?` or `$N` in a parsed SQL statement.
+type Placeholder struct {
+	Index int             // One-based positional index for `?`, or the numeric index for `$N`.
+	Style string          // Placeholder marker style: "?" or "$".
+	Role  PlaceholderRole // Syntactic role at this position.
+
+	ParentFn     *FunctionRef // Function metadata when Role is PlaceholderRoleFunctionArg.
+	CaseClause   CaseClause   // CASE sub-position when Role is PlaceholderRoleCaseExpr.
+	InsertColumn string       // INSERT column filled by this placeholder, when known.
+	UpdateColumn string       // UPDATE SET column assigned by this placeholder, when known.
+	ColumnRef    string       // Predicate column reference, formatted as "table.column" or "column".
+
+	Start int // Start byte offset in the original SQL.
+	End   int // End byte offset in the original SQL.
+}
+
 // CTE describes a common table expression defined in a WITH clause.
 type CTE struct {
 	Name         string
 	Query        string
 	ParsedQuery  *ParsedQuery
 	Materialized string // "", "MATERIALIZED", or "NOT MATERIALIZED"
+	// ColumnAliases holds the explicit output column names from WITH name(a, b);
+	// empty when not declared (the projection in ParsedQuery applies).
+	ColumnAliases []string
 }
 
 // ColumnUsageType defines the context where a column is referenced.
@@ -278,7 +407,57 @@ type ColumnUsage struct {
 	Context    string // Raw clause string for debugging
 	Operator   string
 	Side       string
-	Functions  []string
+	// Functions lists function names that wrap this column reference outside WHERE
+	// clauses (SELECT projection, ORDER BY, GROUP BY, HAVING, etc.) where wrapper
+	// semantics are not used by simulation/materialization. For WHERE-clause
+	// wrappers, see FunctionWrapper which carries typed metadata including args.
+	Functions []string
+	// Function is set only for WHERE-clause predicates whose subject column is wrapped
+	// by an allowlisted function (length, lower, upper, coalesce, extract, date_trunc,
+	// char_length, octet_length). Nil otherwise. See FunctionWrapper.
+	Function *FunctionWrapper
+}
+
+// FunctionWrapper describes a function call that wraps a bare column reference in a
+// WHERE-clause predicate. Populated only on the WHERE-side ColumnUsage entries; nil
+// for projection / ORDER BY / GROUP BY / HAVING / window / RETURNING / JOIN ON usage,
+// for non-allowlisted functions, for schema-qualified names other than pg_catalog,
+// and when the function argument is itself an expression (e.g. length(col || 'x')).
+type FunctionWrapper struct {
+	// Name is the canonical lowercase function name, unqualified. pg_catalog.<name>
+	// is canonicalised to bare <name>; any other schema rejects the wrapper outright.
+	Name string
+	// Schema is the empty string for unqualified calls and for pg_catalog
+	// (canonicalised away). Any other schema causes the wrapper not to be attached.
+	Schema string
+	// Args carries the literal arguments other than the column itself, in source
+	// order (extract field, date_trunc unit, coalesce defaults, etc.). Empty for
+	// single-arg wrappers like length / lower.
+	Args []FunctionArg
+	// IsNested is true when the wrapped column is reached through one or more
+	// additional allowlisted-function wrappers (e.g. lower(lower(col)),
+	// length(lower(col))). Outermost-only attribution: Name reflects the
+	// outermost call; the inner chain is observable only via this flag.
+	IsNested bool
+	// Cast is the textual target type of a typecast applied to the wrapper as a
+	// whole (length(col)::int, CAST(length(col) AS bigint)). Empty when there is
+	// no cast. For chained casts the outermost cast is recorded.
+	Cast string
+}
+
+// FunctionArg is a single non-column argument to a wrapping function in a WHERE
+// predicate (extract field, date_trunc unit, coalesce defaults, etc.).
+type FunctionArg struct {
+	// Literal holds the SQL textual form of a literal argument. Nil means the
+	// argument is a non-literal expression (column reference, sub-call, placeholder).
+	// Consumers requiring a fixed value MUST nil-check and fall back to the
+	// standard column+operator interpretation when nil. Numeric, boolean, and
+	// interval literals are stringified (e.g. "0", "true", "1 day"); string
+	// literals retain their surrounding quotes.
+	Literal *string
+	// IsNull is true when the argument is the explicit SQL NULL keyword. Disjoint
+	// from Literal: a NULL has IsNull=true, Literal=nil.
+	IsNull bool
 }
 
 // StatementParseResult contains the parse outcome for one input statement at the
@@ -315,6 +494,7 @@ type ParsedQuery struct {
 	Limit          *LimitClause
 	JoinConditions []string
 	Parameters     []Parameter
+	Placeholders   []Placeholder // Placeholder occurrences in source-text order.
 	InsertColumns  []string
 	SetClauses     []string
 	Returning      []string

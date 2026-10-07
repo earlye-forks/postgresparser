@@ -13,11 +13,27 @@ import (
 
 var parameterRegex = regexp.MustCompile(`^\$\d+$|^\?$`)
 
-// jsonbExtractTextPattern matches JSONB extraction patterns like: column->>'key' = 'value'
-var jsonbExtractTextPattern = regexp.MustCompile(`(?i)(?:(\w+)\.)?(\w+)\s*(?:->>|->|#>>|#>)\s*'([^']+)'`)
+// jsonbIdentRE matches a quoted (double-quote) or unquoted SQL identifier,
+// so the JSONB patterns recognize forms like `"metadata"` and `u."metadata"`.
+const jsonbIdentRE = `(?:"(?:[^"]|"")+"|\w+)`
 
-// jsonbCastedPattern matches casted JSONB expressions like (metadata->>'score')::int
-var jsonbCastedPattern = regexp.MustCompile(`(?i)\(\s*(?:(\w+)\.)?(\w+)\s*(?:->>|->|#>>|#>)\s*'([^']+)'\s*\)::(\w+)`)
+// jsonbCastTypeRE matches a cast type such as int, pg_catalog.text,
+// numeric(10,2), or int[]. Schema-qualified, length-qualified, and array
+// suffixes are all optional.
+const jsonbCastTypeRE = `\w+(?:\.\w+)?(?:\[\])?(?:\([^)]*\))?`
+
+// jsonbExtractTextPattern matches JSONB extraction patterns like
+// column->>'key', t.column->>'key', and "t"."column"->>'key'.
+var jsonbExtractTextPattern = regexp.MustCompile(
+	`(?i)(?:(` + jsonbIdentRE + `)\.)?(` + jsonbIdentRE + `)\s*(?:->>|->|#>>|#>)\s*'([^']+)'`,
+)
+
+// jsonbCastedPattern matches casted JSONB expressions like
+// (metadata->>'score')::int, (t."metadata"->>'k')::numeric, and
+// (payload->>'v')::pg_catalog.text.
+var jsonbCastedPattern = regexp.MustCompile(
+	`(?i)\(\s*(?:(` + jsonbIdentRE + `)\.)?(` + jsonbIdentRE + `)\s*(?:->>|->|#>>|#>)\s*'([^']+)'\s*\)::(` + jsonbCastTypeRE + `)`,
+)
 
 // betweenAndRegex splits BETWEEN range values on the AND keyword.
 var betweenAndRegex = regexp.MustCompile(`(?i)\s+AND\s+`)
@@ -43,12 +59,27 @@ var jsonbOperators = map[string]bool{
 // Returns a list of conditions with table, column, operator, and value information.
 // Supports all standard SQL operators: =, !=, <>, >, <, >=, <=, BETWEEN, IN, LIKE, IS NULL, etc.
 // Also supports JSONB operators (@>, ?, ?|, ?&) and extraction patterns.
+//
+// In multi-table queries, unqualified columns leave WhereCondition.Table empty.
+// Use ExtractWhereConditionsWithSchema to resolve them via schema metadata.
 func ExtractWhereConditions(query string) ([]WhereCondition, error) {
+	return ExtractWhereConditionsWithSchema(query, nil)
+}
+
+// ExtractWhereConditionsWithSchema is like ExtractWhereConditions, but resolves
+// the table of unqualified columns in multi-table queries. A column is matched
+// against the query's direct FROM relations: base tables via schemaMap, and CTEs
+// or derived tables via their own projection. If exactly one relation exposes
+// the column, that relation is used; zero or multiple matches leave Table empty.
+// The schemaMap is keyed by lowercase table name (same shape as
+// ExtractJoinRelationshipsWithSchema). A nil schemaMap behaves exactly like
+// ExtractWhereConditions.
+func ExtractWhereConditionsWithSchema(query string, schemaMap map[string][]ColumnSchema) ([]WhereCondition, error) {
 	pq, err := postgresparser.ParseSQL(query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse query: %w", err)
 	}
-	return extractWhereConditionsFromParsed(pq), nil
+	return extractWhereConditionsFromParsed(pq, schemaMap), nil
 }
 
 // jsonbInfo holds extracted JSONB operator information.
@@ -89,17 +120,17 @@ func extractJSONBInfo(context string) *jsonbInfo {
 	// Try casted pattern first (more specific)
 	if matches := jsonbCastedPattern.FindStringSubmatch(context); len(matches) == 5 {
 		return &jsonbInfo{
-			column:   matches[2], // Column name (group 1 is alias)
-			key:      matches[3], // Extracted key
-			castType: matches[4], // Cast type
+			column:   ident.TrimQuotes(matches[2]),
+			key:      matches[3],
+			castType: matches[4],
 		}
 	}
 
 	// Try standard extraction pattern
 	if matches := jsonbExtractTextPattern.FindStringSubmatch(context); len(matches) == 4 {
 		return &jsonbInfo{
-			column: matches[2], // Column name (group 1 is alias)
-			key:    matches[3], // Extracted key
+			column: ident.TrimQuotes(matches[2]),
+			key:    matches[3],
 		}
 	}
 
@@ -226,6 +257,8 @@ func extractValueFromContext(context, column, operator string) (any, bool) {
 
 // extractInValues parses IN clause values.
 // Example: "(1, 2, 3)" -> ["1", "2", "3"]
+// Values containing commas inside quotes, nested calls, or arrays are kept
+// whole, e.g. "('Doe, Jane', lower($1))" -> ["Doe, Jane", "lower($1)"].
 func extractInValues(expr string) []string {
 	expr = strings.TrimSpace(expr)
 
@@ -233,8 +266,8 @@ func extractInValues(expr string) []string {
 	expr = strings.TrimPrefix(expr, "(")
 	expr = strings.TrimSuffix(expr, ")")
 
-	// Split by comma
-	parts := strings.Split(expr, ",")
+	// Split on top-level commas only
+	parts := splitCommasRespectingParens(expr)
 	values := make([]string, 0, len(parts))
 
 	for _, part := range parts {
